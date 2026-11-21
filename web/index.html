@@ -366,7 +366,7 @@ function eventHtml(e, q, target) {
     (e.ts ? `<span title="JSONL line ${e.seq}">${esc(when(e.ts))}</span>` : "");
   const body = richText(e.text, q);
   if (e.role === "tool_call" || e.role === "tool_result" || e.role === "thinking") {
-    const first = e.text.split("\n").find((l) => l.trim() && !/^[{}\[\]]$/.test(l.trim())) ?? "";
+    const first = e.text.split("\n").find((l) => l.trim() && !/^[{}\[\]]$/.test(l.trim()) && !/:\s*null,?$/.test(l)) ?? "";
     return `<article class="${cls}" id="ev-${e.idx}"><details${target ? " open" : ""}>
       <summary>${head}<span class="preview">${esc(first.trim().slice(0, 200))}</span><span>${e.text.length.toLocaleString()} chars</span></summary>
       <pre>${body}</pre></details></article>`;

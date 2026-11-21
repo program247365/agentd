@@ -112,10 +112,7 @@ mod tests {
 
     #[test]
     fn machine_names_are_sql_safe() {
-        assert_eq!(
-            sanitize_machine("Pat's MacBook Pro"),
-            "Pat-s-MacBook-Pro"
-        );
+        assert_eq!(sanitize_machine("Pat's MacBook Pro"), "Pat-s-MacBook-Pro");
         assert_eq!(sanitize_machine("x'; DROP"), "x---DROP");
         assert_eq!(sanitize_machine("''"), "unknown");
     }
