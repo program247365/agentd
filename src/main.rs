@@ -3,12 +3,14 @@
 mod archive;
 mod config;
 mod dolt;
+mod hub;
 mod redact;
 mod server;
 mod service;
 mod sources;
 mod sync;
 mod transcript;
+mod tunnel;
 mod vault;
 mod view;
 
@@ -65,6 +67,11 @@ enum Cmd {
     },
     /// Print a redacted secret from this Mac's vault
     Reveal { id: String },
+    /// The sync hub, for the server your Macs sync through (see README)
+    Hub {
+        #[command(subcommand)]
+        action: HubCmd,
+    },
     /// Install or remove the LaunchAgents (serve + a run every 30 minutes)
     Service {
         #[command(subcommand)]
@@ -76,12 +83,44 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum SyncCmd {
-    /// Sync with a Dolt remote (e.g. http://my-server:50051/agents, s3://bucket/agents, file:///Volumes/nas/agents)
-    Add { url: String },
+    /// Sync with a remote: ssh://[user@]host[:22]/agents[?port=50052] for an agentd hub
+    /// reached through an SSH tunnel, or any Dolt remote URL (s3://…, file://…, http://…)
+    Add {
+        url: String,
+        /// remotes-API user (ssh:// remotes default to the hub's "agentd");
+        /// a password, if needed, comes from AGENTD_REMOTE_PASSWORD
+        #[arg(long)]
+        user: Option<String>,
+    },
     /// Stop syncing (the local archive is kept)
     Remove,
     /// Show the remote, if any
     Status,
+    /// Create this Mac's sync key (once) and print the line for the server's authorized_keys
+    Key {
+        /// the hub's remotes port the key may forward to
+        #[arg(long, default_value_t = tunnel::DEFAULT_REMOTES_PORT)]
+        port: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum HubCmd {
+    /// Run the sync hub in the foreground (Dolt sql-server; SQL on 127.0.0.1)
+    Serve {
+        /// data directory (default: $SRV_DATA_DIR, else ~/.local/share/agentd-hub)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        #[arg(long, default_value = "agents")]
+        database: String,
+        #[arg(long, default_value_t = tunnel::DEFAULT_REMOTES_PORT)]
+        remotes_port: u16,
+        #[arg(long, default_value_t = 3851)]
+        sql_port: u16,
+        /// answer GET /health on 127.0.0.1 (default: $PORT, if set)
+        #[arg(long)]
+        health_port: Option<u16>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -207,18 +246,42 @@ fn run(cli: Cli) -> Result<bool> {
         }
         Cmd::Sync { action } => {
             match action {
-                Some(SyncCmd::Add { url }) => {
-                    sync::add(&cfg, &url)?;
+                Some(SyncCmd::Add { url, user }) => {
+                    sync::add(&cfg, &url, user)?;
                     println!("syncing with {url}; run `agentd sync` (or wait for the next scheduled run)");
                 }
                 Some(SyncCmd::Remove) => {
                     sync::remove(&cfg)?;
                     println!("sync removed; the local archive is unchanged");
                 }
-                Some(SyncCmd::Status) => match sync::remote_url(&cfg.archive_dir())? {
-                    Some(u) => println!("remote: {u}\nmachine: {}", cfg.machine),
-                    None => println!("local-only (no remote); machine: {}", cfg.machine),
-                },
+                Some(SyncCmd::Status) => {
+                    match sync::remote_url(&cfg.archive_dir())? {
+                        Some(u) => {
+                            let s = tunnel::load(&cfg)?;
+                            match &s.ssh {
+                            Some(t) => println!(
+                                "remote: {u}\nthrough: ssh tunnel to {} (port {}) → hub port {}{}",
+                                t.target,
+                                t.ssh_port,
+                                t.remote_port,
+                                t.key.as_ref().map(|k| format!(", key {}", k.display())).unwrap_or_default()
+                            ),
+                            None => println!("remote: {u}"),
+                        }
+                            println!("machine: {}", cfg.machine);
+                        }
+                        None => println!("local-only (no remote); machine: {}", cfg.machine),
+                    }
+                }
+                Some(SyncCmd::Key { port }) => {
+                    let line = tunnel::ensure_key(&cfg, port)?;
+                    eprintln!(
+                        "key: {} (dedicated to agentd; no passphrase so it works unattended)",
+                        tunnel::key_path(&cfg).display()
+                    );
+                    eprintln!("add this line to ~/.ssh/authorized_keys on the server (forwarding to port {port} only, no shell):");
+                    println!("{line}");
+                }
                 None => {
                     let v = vault(&cfg)?;
                     let s = sync::run(&cfg, &literals, Some(&v))?;
@@ -228,6 +291,32 @@ fn run(cli: Cli) -> Result<bool> {
             }
         }
         Cmd::Serve { port } => server::serve(&cfg, port)?,
+        Cmd::Hub {
+            action:
+                HubCmd::Serve {
+                    dir,
+                    database,
+                    remotes_port,
+                    sql_port,
+                    health_port,
+                },
+        } => {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default();
+            let dir = dir
+                .or_else(|| std::env::var_os("SRV_DATA_DIR").map(std::path::PathBuf::from))
+                .unwrap_or_else(|| home.join(".local/share/agentd-hub"));
+            let health_port =
+                health_port.or_else(|| std::env::var("PORT").ok().and_then(|p| p.parse().ok()));
+            hub::serve(hub::HubOpts {
+                dir,
+                database,
+                remotes_port,
+                sql_port,
+                health_port,
+            })?;
+        }
         Cmd::Verify { json } => {
             let v = vault(&cfg)?;
             let r = archive::verify(&cfg, &literals, Some(&v))?;

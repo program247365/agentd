@@ -49,7 +49,9 @@ Also worth doing for Claude Code, so the transcripts exist to archive: set
 | `agentd secrets [--json]` | count secrets by kind (never values), in the archive and in the agents' own files |
 | `agentd redact [--add]` | re-redact everything and drop the archive's history; `--add` reads an extra string from stdin |
 | `agentd reveal <id>` | print a redacted value from this Mac's vault |
-| `agentd sync add <url>` / `sync` / `sync status` / `sync remove` | sync with a Dolt remote |
+| `agentd sync add <url>` / `sync` / `sync status` / `sync remove` | sync with a remote (`ssh://` for a hub) |
+| `agentd sync key` | this Mac's sync key and its restricted `authorized_keys` line |
+| `agentd hub serve` | run the sync hub on a server |
 | `agentd service install` / `uninstall` | LaunchAgents |
 | `agentd paths` | where everything lives |
 
@@ -70,25 +72,71 @@ originals of redacted secrets), `redact-literals` (your extra strings, 0600).
 
 ## Syncing between Macs
 
-A fresh install is local-only. To sync, give every Mac the same
-[Dolt remote](https://docs.dolthub.com/concepts/dolt/git/remotes):
+A fresh install is local-only. To sync, point every Mac at one remote.
+
+### Your own hub, over SSH (recommended)
+
+Any machine you can SSH into becomes the hub. Nothing new is exposed: the
+Macs reach it through an SSH tunnel opened for each sync, with a dedicated
+key per Mac that may only forward to the hub's port.
+
+On the server:
 
 ```sh
-agentd sync add http://my-server:50051/agents     # dolt remotesrv
-agentd sync add 's3://bucket/agents?endpoint=…'    # S3, R2, MinIO
-agentd sync add file:///Volumes/nas/agents         # a shared folder
+brew install program247365/tap/agentd
+agentd hub serve      # foreground: run it under launchd, systemd or your supervisor
+```
+
+On each Mac:
+
+```sh
+agentd sync key       # makes a key for agentd and prints one line:
+                      # restrict,port-forwarding,permitopen="127.0.0.1:50052",command="/usr/bin/false" ssh-ed25519 …
+                      # append it to ~/.ssh/authorized_keys on the server
+agentd sync add ssh://you@server/agents
+agentd sync           # or wait for the scheduled run
+```
+
+`ssh://[user@]host[:ssh-port]/<database>[?port=<hub port>&key=<path>]`.
+Losing a Mac means deleting one line from `authorized_keys`.
+
+What the hub does (`agentd hub serve [--dir] [--remotes-port 50052] [--sql-port 3851] [--health-port N]`):
+it runs `dolt sql-server` with SQL on 127.0.0.1, and before the remotes port
+ever opens it sets a random root password (kept 0600 in the hub dir) and
+creates an `agentd@localhost` user with no password. The tunnel arrives on
+the server's loopback, so it signs in as that user.
+
+Know this about the hub: **Dolt's remotes API listens on every interface**;
+there is no option to bind it to loopback. A client that reaches the port
+directly is anonymous, which Dolt treats as root, and root's password is
+random and never shown. That makes the port useless without SSH, but it is
+still open. Block it at the server's firewall if you can.
+
+`--dir` defaults to `$SRV_DATA_DIR`, then `~/.local/share/agentd-hub`;
+`--health-port` defaults to `$PORT`; `GET /health` answers 200 while the
+database does. So under a supervisor that provides those (like srv), the
+service is just `agentd hub serve`.
+
+### Any other Dolt remote
+
+```sh
+agentd sync add 's3://bucket/agents?endpoint=…'   # S3, R2, MinIO
+agentd sync add file:///Volumes/nas/agents        # a shared folder
+agentd sync add http://host:50052/agents --user name   # password: AGENTD_REMOTE_PASSWORD
 ```
 
 What crosses the wire is the archive: already redacted, with secrets only
-as markers. The remote's operator can read it. Put the remote somewhere only
-your machines reach (for `dolt remotesrv`, a private network such as
-Tailscale), or use storage you trust.
+as markers. Whoever runs the remote can read it.
 
-Each Mac writes only rows keyed by its own name (`AGENTD_MACHINE`, default the
-Mac's LocalHostName), so pulls merge cleanly. After `agentd redact` on any Mac,
-the next sync force-pushes the rewritten history; every other Mac finds no
-common ancestor, resets to it, and re-adds its own files from disk and from
-its local copy, so nothing it kept is lost.
+### How sync behaves
+
+Each Mac writes only rows keyed by its own name (`AGENTD_MACHINE`, default
+the Mac's LocalHostName), so pulls merge cleanly. The first Mac to reach a
+new hub publishes over the hub's empty first commit. After `agentd redact`
+on any Mac, the next sync force-pushes the rewritten history; every other
+Mac finds no common ancestor, resets to it, and re-adds its own files from
+disk and from its local copy, so nothing it kept is lost. Any Mac that can
+sync can force-push, so back the hub up (`dolt backup`) somewhere else.
 
 ## Secrets: what redaction can and can't do
 

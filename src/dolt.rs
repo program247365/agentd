@@ -12,8 +12,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub type Row = Map<String, Value>;
 
 pub fn dolt(dir: &Path, args: &[&str]) -> Result<String> {
+    dolt_env(dir, args, &[])
+}
+
+/// Passwords go through the environment (DOLT_CLI_PASSWORD,
+/// DOLT_REMOTE_PASSWORD), never argv, where `ps` would show them.
+pub fn dolt_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
     let out = Command::new("dolt")
         .args(args)
+        .envs(env.iter().copied())
         .current_dir(dir)
         .output()
         .context("running dolt (is it installed? brew install dolt)")?;

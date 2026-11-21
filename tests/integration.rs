@@ -419,3 +419,180 @@ fn server_refuses_foreign_hosts_and_unguarded_reveals() {
     server.kill().unwrap();
     server.wait().unwrap();
 }
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// The hub runs in its own process group so the test can stop it and the
+/// dolt sql-server it started together (launchd does the same for a job).
+struct Hub {
+    child: std::process::Child,
+    remotes: u16,
+}
+
+impl Drop for Hub {
+    fn drop(&mut self) {
+        let _ = Command::new("kill")
+            .args(["-TERM", &format!("-{}", self.child.id())])
+            .status();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_hub(dir: &Path) -> Hub {
+    use std::os::unix::process::CommandExt;
+    let (remotes, sql, health) = (free_port(), free_port(), free_port());
+    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["hub", "serve", "--dir", dir.to_str().unwrap()])
+        .args([
+            "--remotes-port",
+            &remotes.to_string(),
+            "--sql-port",
+            &sql.to_string(),
+        ])
+        .args(["--health-port", &health.to_string()])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let out = Command::new("curl")
+            .args(["-s", "-o", "/dev/null", "-w", "%{http_code}"])
+            .arg(format!("http://127.0.0.1:{health}/health"))
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&out.stdout) == "200" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "hub never became healthy"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    Hub { child, remotes }
+}
+
+#[test]
+fn two_macs_sync_through_an_ssh_tunnel_to_a_hub() {
+    if !have_dolt() || Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping: needs dolt and python3");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let hub_dir = base.path().join("hub");
+    let hub = start_hub(&hub_dir);
+
+    // the hub locked root down before opening the remotes port
+    let pw = hub_dir.join("root-password");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&pw).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let anon = Command::new("dolt")
+        .args([
+            "clone",
+            &format!("http://127.0.0.1:{}/agents", hub.remotes),
+            base.path().join("anon").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!anon.status.success(), "anonymous clone must be refused");
+    assert!(
+        String::from_utf8_lossy(&anon.stderr).contains("Access denied"),
+        "{}",
+        String::from_utf8_lossy(&anon.stderr)
+    );
+
+    let fake_ssh = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_ssh.py");
+    let url = format!("ssh://agentd@hub-host/agents?port={}", hub.remotes);
+    let a = Mac::new(base.path(), "mac-a", KEY_A);
+    let b = Mac::new(base.path(), "mac-b", KEY_B);
+    a.write_claude(
+        "-Users-x-alpha",
+        UUID_A,
+        &session("claude-opus-5-5", "/Users/x/alpha", "a asks", "ls", "ok"),
+    );
+    b.write_claude(
+        "-Users-x-beta",
+        UUID_B,
+        &session("claude-fable-5", "/Users/x/beta", "b asks", "pwd", "/tmp"),
+    );
+    let run = |m: &Mac, args: &[&str]| {
+        let out = m.cmd(args).env("AGENTD_SSH", &fake_ssh).output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "agentd {args:?} on {}: {text}",
+            m.name
+        );
+        text
+    };
+    for m in [&a, &b] {
+        run(m, &["sync", "add", &url]);
+        assert!(run(m, &["sync", "status"]).contains("ssh tunnel to agentd@hub-host"));
+    }
+    // a is first at the new hub: it publishes over the hub's empty first commit
+    let out = run(&a, &["run"]);
+    assert!(out.contains("force-pushed"), "{out}");
+    let out = run(&b, &["run"]);
+    assert!(out.contains("pulled and pushed"), "{out}");
+    run(&a, &["run"]);
+    for m in [&a, &b] {
+        let machines: Vec<String> = m
+            .sessions("")
+            .iter()
+            .map(|r| r["machine"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(machines, ["mac-a", "mac-b"], "{} sees both Macs", m.name);
+        assert_eq!(m.verify()["ok"], true, "{}: {}", m.name, m.verify());
+    }
+    // the tunnel is gone after each sync: nothing left listening locally
+    let s: Value =
+        serde_json::from_slice(&std::fs::read(a.home.join("sync.json")).unwrap()).unwrap();
+    let local = s["ssh"]["local_port"].as_u64().unwrap() as u16;
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", local)).is_err(),
+        "tunnel left open"
+    );
+
+    // a Mac whose key the server refuses: the sync fails loudly, the archive is untouched
+    let c = Mac::new(base.path(), "mac-c", KEY_A);
+    c.write_claude(
+        "-Users-x-gamma",
+        UUID_C,
+        &session("claude-opus-5-5", "/Users/x/gamma", "c asks", "ls", "ok"),
+    );
+    run(&c, &["ingest"]);
+    run(
+        &c,
+        &[
+            "sync",
+            "add",
+            &format!("ssh://denied@hub-host/agents?port={}", hub.remotes),
+        ],
+    );
+    let out = c
+        .cmd(&["run"])
+        .env("AGENTD_SSH", &fake_ssh)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("Permission denied (publickey)"), "{text}");
+    assert_eq!(c.verify()["ok"], true, "{}", c.verify());
+}

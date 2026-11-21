@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::dolt::{self, get_str};
 use crate::redact;
 use crate::sources::{self, KINDS};
+use crate::tunnel::{self, SyncConfig};
 use crate::vault::Vault;
 use anyhow::{bail, Result};
 use serde::Serialize;
@@ -37,13 +38,29 @@ pub fn remote_url(dir: &Path) -> Result<Option<String>> {
         .map(|(_, u)| u))
 }
 
-pub fn add(cfg: &Config, url: &str) -> Result<()> {
+/// `ssh://…` remotes go through a tunnel (see tunnel.rs); anything else is
+/// handed to Dolt as-is, optionally with a remotes-API user.
+pub fn add(cfg: &Config, url: &str, user: Option<String>) -> Result<()> {
     let dir = cfg.archive_dir();
     archive::ensure(&dir, &cfg.machine, dolt::now_ms())?;
     if let Some(existing) = remote_url(&dir)? {
         bail!("already syncing with {existing}; run `agentd sync remove` first");
     }
-    dolt::dolt(&dir, &["remote", "add", REMOTE, url])?;
+    let (dolt_url, settings) = if url.starts_with("ssh://") {
+        let key = Some(tunnel::key_path(cfg)).filter(|k| k.exists());
+        let (t, dolt_url) = tunnel::parse_ssh_url(url, key)?;
+        (
+            dolt_url,
+            SyncConfig {
+                user: Some(user.unwrap_or_else(|| tunnel::HUB_USER.into())),
+                ssh: Some(t),
+            },
+        )
+    } else {
+        (url.to_string(), SyncConfig { user, ssh: None })
+    };
+    dolt::dolt(&dir, &["remote", "add", REMOTE, &dolt_url])?;
+    tunnel::save(cfg, &settings)?;
     Ok(())
 }
 
@@ -52,8 +69,22 @@ pub fn remove(cfg: &Config) -> Result<()> {
     if remote_url(&dir)?.is_some() {
         dolt::dolt(&dir, &["remote", "remove", REMOTE])?;
     }
+    tunnel::clear(cfg);
     let _ = std::fs::remove_file(cfg.force_push_flag());
     Ok(())
+}
+
+/// fetch/push against the remote, with the configured user. The password
+/// (none, for an agentd hub reached through a tunnel) comes from
+/// AGENTD_REMOTE_PASSWORD, via the environment rather than argv.
+fn remote(dir: &Path, s: &SyncConfig, verb: &str, rest: &[&str]) -> Result<String> {
+    let mut args = vec![verb];
+    if let Some(u) = &s.user {
+        args.extend(["--user", u.as_str()]);
+    }
+    args.extend_from_slice(rest);
+    let pw = std::env::var("AGENTD_REMOTE_PASSWORD").unwrap_or_default();
+    dolt::dolt_env(dir, &args, &[("DOLT_REMOTE_PASSWORD", pw.as_str())])
 }
 
 #[derive(Debug, Serialize, Default, PartialEq)]
@@ -75,6 +106,15 @@ fn remote_has_branch(dir: &Path) -> Result<bool> {
     )? > 0)
 }
 
+/// A fresh hub database has only its own first commit: no archive yet.
+fn remote_has_archive(dir: &Path) -> bool {
+    dolt::count(
+        dir,
+        &format!("SELECT COUNT(*) AS n FROM files AS OF '{REMOTE}/{BRANCH}'"),
+    )
+    .is_ok()
+}
+
 fn unrelated(err: &str) -> bool {
     let e = err.to_lowercase();
     e.contains("no common ancestor") || e.contains("unrelated") || e.contains("common ancestor")
@@ -92,16 +132,30 @@ pub fn run(cfg: &Config, literals: &[String], vault: Option<&Vault>) -> Result<S
     if archive::dirty(&dir)? {
         bail!("archive has uncommitted changes; run `agentd ingest` first");
     }
+    let settings = tunnel::load(cfg)?;
+    // held for the whole sync; closed on return, success or not
+    let _tunnel = match &settings.ssh {
+        Some(t) => Some(tunnel::open(cfg, t)?),
+        None => None,
+    };
     if cfg.force_push_flag().exists() {
         // This Mac rewrote history (redact). Its archive already holds every
         // machine's rows as of its last pull, redacted; publish it as-is.
-        dolt::dolt(&dir, &["push", "--force", REMOTE, BRANCH])?;
+        remote(&dir, &settings, "push", &["--force", REMOTE, BRANCH])?;
         std::fs::remove_file(cfg.force_push_flag())?;
         res.force_pushed = true;
         res.pushed = true;
         return Ok(res);
     }
-    dolt::dolt(&dir, &["fetch", REMOTE])?;
+    remote(&dir, &settings, "fetch", &[REMOTE])?;
+    if remote_has_branch(&dir)? && !remote_has_archive(&dir) {
+        // the first Mac to reach a new hub publishes its archive over the
+        // hub's empty first commit
+        remote(&dir, &settings, "push", &["--force", REMOTE, BRANCH])?;
+        res.pushed = true;
+        res.force_pushed = true;
+        return Ok(res);
+    }
     if remote_has_branch(&dir)? {
         match dolt::dolt(&dir, &["merge", &format!("{REMOTE}/{BRANCH}")]) {
             Ok(_) => res.pulled = true,
@@ -120,7 +174,7 @@ pub fn run(cfg: &Config, literals: &[String], vault: Option<&Vault>) -> Result<S
             bail!("merge produced conflicts, which shouldn't happen (rows are keyed by machine); aborted, nothing changed");
         }
     }
-    dolt::dolt(&dir, &["push", REMOTE, BRANCH])?;
+    remote(&dir, &settings, "push", &[REMOTE, BRANCH])?;
     res.pushed = true;
     Ok(res)
 }
@@ -170,6 +224,7 @@ fn reset_to_remote(cfg: &Config, literals: &[String], vault: Option<&Vault>) -> 
     keep.retain(|e| !present.contains(&format!("{}\t{}\t{}", cfg.machine, e.kind, e.rel_path)));
     let restored = keep.len();
     let at = dolt::now_ms();
+    archive::ensure(&dir, &cfg.machine, at)?;
     archive::write_entries(&dir, &cfg.machine, keep)?;
     archive::commit(
         &dir,
