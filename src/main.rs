@@ -451,7 +451,11 @@ fn run(cli: Cli) -> Result<bool> {
                 .unwrap_or_default();
             println!("vault     {}{n}", cfg.home.join("vault.sqlite").display());
             println!("literals  {}", cfg.literals_file().display());
-            println!("machine   {}", cfg.machine);
+            println!(
+                "machine   {}  (fixed in {})",
+                cfg.machine,
+                cfg.machine_file().display()
+            );
         }
     }
     Ok(true)

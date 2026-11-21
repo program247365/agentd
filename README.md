@@ -130,8 +130,12 @@ as markers. Whoever runs the remote can read it.
 
 ### How sync behaves
 
-Each Mac writes only rows keyed by its own name (`AGENTD_MACHINE`, default
-the Mac's LocalHostName), so pulls merge cleanly. The first Mac to reach a
+Each Mac writes only rows keyed by its own name, so pulls merge cleanly.
+The name is the Mac's LocalHostName on first run, saved to
+`~/.local/share/agentd/machine` so renaming the Mac later changes nothing
+(`AGENTD_MACHINE` overrides it). To rename on purpose, edit that file:
+rows already archived keep the old name, and the vault's Keychain key is
+looked up by the name, so reveal secrets from before first. The first Mac to reach a
 new hub publishes over the hub's empty first commit. After `agentd redact`
 on any Mac, the next sync force-pushes the rewritten history; every other
 Mac finds no common ancestor, resets to it, and re-adds its own files from
