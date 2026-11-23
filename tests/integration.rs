@@ -344,10 +344,65 @@ fn two_macs_sync_through_a_remote_and_a_redact_propagates() {
     );
     assert_eq!(b.verify()["archive_only"].as_array().unwrap().len(), 2);
 
-    // after the redact, both Macs sync again and are still recorded
+    // after the redact, b (which went through reset_to_remote) and a sync again
+    let before = b.dolt("SELECT synced_at_ms FROM syncs WHERE machine = 'mac-b'");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    b.run(&["run"]);
     a.run(&["run"]);
-    let rows = a.dolt("SELECT machine FROM syncs ORDER BY machine");
-    assert!(rows.contains("mac-a") && rows.contains("mac-b"), "{rows}");
+    for m in [&a, &b] {
+        let rows = m.dolt("SELECT machine FROM syncs ORDER BY machine");
+        assert!(
+            rows.contains("mac-a") && rows.contains("mac-b"),
+            "{}: {rows}",
+            m.name
+        );
+    }
+    let after = b.dolt("SELECT synced_at_ms FROM syncs WHERE machine = 'mac-b'");
+    let ms = |s: &str| s.lines().last().unwrap().parse::<i64>().unwrap();
+    assert!(ms(&after) > ms(&before), "{before} -> {after}");
+    let a_view = a.dolt("SELECT synced_at_ms FROM syncs WHERE machine = 'mac-b'");
+    assert_eq!(ms(&a_view), ms(&after), "a pulled b's post-restore sync");
+}
+
+#[test]
+fn sync_works_on_an_archive_created_before_the_syncs_table() {
+    if !have_dolt() {
+        eprintln!("skipping: dolt not installed");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let remote = base.path().join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    let url = format!("file://{}", remote.display());
+    let a = Mac::new(base.path(), "mac-a", KEY_A);
+    a.write_claude(
+        "-Users-x-alpha",
+        UUID_A,
+        &session("claude-opus-5-5", "/Users/x/alpha", "q", "ls", "out"),
+    );
+    a.run(&["ingest"]);
+    a.run(&["sync", "add", &url]);
+    // simulate an archive from before this change
+    a.dolt("DROP TABLE syncs");
+    a.dolt("CALL DOLT_COMMIT('-A', '-m', 'pre-syncs archive')");
+    a.run(&["sync"]);
+    assert!(a.dolt("SELECT machine FROM syncs").contains("mac-a"));
+    let clone = base.path().join("clone");
+    let out = Command::new("dolt")
+        .args(["clone", &url, clone.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows = Command::new("dolt")
+        .args(["sql", "-r", "csv", "-q", "SELECT machine FROM syncs"])
+        .current_dir(&clone)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&rows.stdout).contains("mac-a"));
 }
 
 #[test]

@@ -111,6 +111,9 @@ pub fn commit(dir: &Path, machine: &str, message: &str, at_ms: i64) -> Result<bo
 /// when each last synced. `machine` is spliced into SQL: dolt:: has no
 /// parameters, but config::sanitize_machine limits it to [A-Za-z0-9-].
 pub fn record_sync(dir: &Path, machine: &str, at_ms: i64) -> Result<()> {
+    // `sync` can run on an archive created before `syncs` existed, and only
+    // `ingest` applies SCHEMA; the table is committed together with the row
+    dolt::dolt(dir, &["sql", "-q", SCHEMA])?;
     dolt::dolt(
         dir,
         &[
