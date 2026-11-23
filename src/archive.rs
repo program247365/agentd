@@ -455,6 +455,15 @@ pub fn redact_archive(
         // each machine's rows keep their machine
         write_entries(&fresh, &machine, entries)?;
     }
+    // sync records of every Mac live in `syncs`, not `files`: carry them over.
+    // An archive from before the table existed simply has none to carry.
+    let syncs = dolt::select(
+        &dir,
+        "SELECT machine, synced_at_ms, agentd_version FROM syncs",
+    )
+    .unwrap_or_default();
+    let syncs: Vec<Value> = syncs.into_iter().map(Value::Object).collect();
+    dolt::import(&fresh, "syncs", &syncs)?;
     commit(
         &fresh,
         &cfg.machine,

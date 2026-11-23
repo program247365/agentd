@@ -280,6 +280,27 @@ fn two_macs_sync_through_a_remote_and_a_redact_propagates() {
     assert!(add.wait().unwrap().success());
     let out = a.run(&["run"]);
     assert!(out.contains("force-pushed"), "{out}");
+    // the rewrite must carry b's sync record, before b syncs again
+    let after_redact = base.path().join("clone-after-redact");
+    let cloned = Command::new("dolt")
+        .args(["clone", &url, after_redact.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        cloned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cloned.stderr)
+    );
+    let synced = Command::new("dolt")
+        .args(["sql", "-r", "csv", "-q", "SELECT machine FROM syncs"])
+        .current_dir(&after_redact)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&synced.stdout).contains("mac-b"),
+        "redact dropped b's syncs row: {}",
+        String::from_utf8_lossy(&synced.stdout)
+    );
     // meanwhile b archived a session it hasn't synced, then the agent deleted
     // it: the reset to a's rewritten history must not lose it
     let unsynced = b.write_claude(
