@@ -23,3 +23,14 @@ drive the real binary and need `dolt` on PATH). Fix the code, not the check.
 - `serve` binds 127.0.0.1, checks Host, and gates reveals behind the
   `X-Agentd-Reveal` header + same-origin; keep all three.
 - No personal data in this repo: no hostnames, usernames or server URLs.
+
+## Troubleshooting sync
+
+- `ssh tunnel to … exited (exit status: 255): ssh: Could not resolve
+  hostname <host>.ts.net` means the Mac's Tailscale is disconnected, not an
+  agentd bug: MagicDNS names only resolve while Tailscale is up. With the
+  macOS Tailscale app, check `/Applications/Tailscale.app/Contents/MacOS/Tailscale
+  status` (a Homebrew `tailscale` CLI talks to a separate daemon and gives a
+  misleading "not running" error). Scheduled syncs keep failing this way
+  until Tailscale reconnects; the next run after that syncs normally, and
+  nothing is lost in between (ingest still runs locally).
