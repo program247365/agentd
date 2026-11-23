@@ -141,6 +141,7 @@ pub fn run(cfg: &Config, literals: &[String], vault: Option<&Vault>) -> Result<S
     if cfg.force_push_flag().exists() {
         // This Mac rewrote history (redact). Its archive already holds every
         // machine's rows as of its last pull, redacted; publish it as-is.
+        archive::record_sync(&dir, &cfg.machine, dolt::now_ms())?;
         remote(&dir, &settings, "push", &["--force", REMOTE, BRANCH])?;
         std::fs::remove_file(cfg.force_push_flag())?;
         res.force_pushed = true;
@@ -151,6 +152,7 @@ pub fn run(cfg: &Config, literals: &[String], vault: Option<&Vault>) -> Result<S
     if remote_has_branch(&dir)? && !remote_has_archive(&dir) {
         // the first Mac to reach a new hub publishes its archive over the
         // hub's empty first commit
+        archive::record_sync(&dir, &cfg.machine, dolt::now_ms())?;
         remote(&dir, &settings, "push", &["--force", REMOTE, BRANCH])?;
         res.pushed = true;
         res.force_pushed = true;
@@ -174,6 +176,7 @@ pub fn run(cfg: &Config, literals: &[String], vault: Option<&Vault>) -> Result<S
             bail!("merge produced conflicts, which shouldn't happen (rows are keyed by machine); aborted, nothing changed");
         }
     }
+    archive::record_sync(&dir, &cfg.machine, dolt::now_ms())?;
     remote(&dir, &settings, "push", &[REMOTE, BRANCH])?;
     res.pushed = true;
     Ok(res)

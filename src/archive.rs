@@ -30,7 +30,13 @@ CREATE TABLE IF NOT EXISTS file_lines (
   machine VARCHAR(64) NOT NULL, kind VARCHAR(16) NOT NULL, rel_path VARCHAR(1024) NOT NULL,
   seq INT NOT NULL, line LONGTEXT NOT NULL,
   PRIMARY KEY (machine, kind, rel_path, seq)
+);
+CREATE TABLE IF NOT EXISTS syncs (
+  machine VARCHAR(64) PRIMARY KEY, synced_at_ms BIGINT NOT NULL, agentd_version VARCHAR(32) NOT NULL
 );";
+
+/// Message of the commit that records a sync; it is not an ingest.
+pub const SYNC_COMMIT: &str = "record sync";
 
 const IMPORT_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
@@ -101,6 +107,25 @@ pub fn commit(dir: &Path, machine: &str, message: &str, at_ms: i64) -> Result<bo
     Ok(true)
 }
 
+/// Records that this Mac is about to push, so other Macs and the hub can see
+/// when each last synced. `machine` is spliced into SQL: dolt:: has no
+/// parameters, but config::sanitize_machine limits it to [A-Za-z0-9-].
+pub fn record_sync(dir: &Path, machine: &str, at_ms: i64) -> Result<()> {
+    dolt::dolt(
+        dir,
+        &[
+            "sql",
+            "-q",
+            &format!(
+                "REPLACE INTO syncs (machine, synced_at_ms, agentd_version) VALUES ('{machine}', {at_ms}, '{}')",
+                env!("CARGO_PKG_VERSION")
+            ),
+        ],
+    )?;
+    commit(dir, machine, SYNC_COMMIT, at_ms)?;
+    Ok(())
+}
+
 /// Start time of this machine's last ingest that changed anything (not the
 /// HEAD date: a sync's merge commit or `dolt init` would be "now").
 pub fn last_ingest_ms(dir: &Path, machine: &str) -> Result<Option<i64>> {
@@ -108,6 +133,7 @@ pub fn last_ingest_ms(dir: &Path, machine: &str) -> Result<Option<i64>> {
         dir,
         &format!(
             "SELECT date FROM dolt_log WHERE email = 'agentd@{machine}' AND message <> 'Initialize data repository'
+             AND message <> '{SYNC_COMMIT}'
              ORDER BY date DESC LIMIT 1"
         ),
     )?;

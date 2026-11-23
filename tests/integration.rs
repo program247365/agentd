@@ -257,6 +257,9 @@ fn two_macs_sync_through_a_remote_and_a_redact_propagates() {
         assert_eq!(v["ok"], true, "{}: {v}", m.name);
         assert_eq!(v["other_machines"], 1);
     }
+    let rows = a.dolt("SELECT machine, agentd_version FROM syncs ORDER BY machine");
+    assert!(rows.contains("mac-a") && rows.contains("mac-b"), "{rows}");
+    assert!(rows.contains(env!("CARGO_PKG_VERSION")), "{rows}");
 
     // b deletes its transcript after it's been synced; it must survive a's redact
     std::fs::remove_file(&b_file).unwrap();
@@ -340,6 +343,39 @@ fn two_macs_sync_through_a_remote_and_a_redact_propagates() {
         "{b_rows:?}"
     );
     assert_eq!(b.verify()["archive_only"].as_array().unwrap().len(), 2);
+
+    // after the redact, both Macs sync again and are still recorded
+    a.run(&["run"]);
+    let rows = a.dolt("SELECT machine FROM syncs ORDER BY machine");
+    assert!(rows.contains("mac-a") && rows.contains("mac-b"), "{rows}");
+}
+
+#[test]
+fn sync_commits_do_not_move_last_ingest() {
+    if !have_dolt() {
+        eprintln!("skipping: dolt not installed");
+        return;
+    }
+    let base = tempfile::tempdir().unwrap();
+    let remote = base.path().join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    let url = format!("file://{}", remote.display());
+    let a = Mac::new(base.path(), "mac-a", KEY_A);
+    a.write_claude(
+        "-Users-x-alpha",
+        UUID_A,
+        &session("claude-opus-5-5", "/Users/x/alpha", "q", "ls", "out"),
+    );
+    a.run(&["ingest"]);
+    a.run(&["sync", "add", &url]);
+    let before = a.verify();
+    assert_eq!(before["ok"], true, "{before}");
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    a.run(&["sync"]);
+    a.run(&["sync"]);
+    let after = a.verify();
+    assert_eq!(after["ok"], true, "{after}");
+    assert_eq!(after["last_ingest"], before["last_ingest"]);
 }
 
 #[test]
