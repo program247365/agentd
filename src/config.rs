@@ -71,6 +71,10 @@ impl Config {
     pub fn force_push_flag(&self) -> PathBuf {
         self.home.join("force-push-pending")
     }
+    /// `agentd serve`'s bearer token (0600); `agentd open` hands it to a browser.
+    pub fn serve_token_file(&self) -> PathBuf {
+        self.home.join("serve-token")
+    }
 }
 
 /// Machine names are spliced into SQL and used as commit emails, so they are

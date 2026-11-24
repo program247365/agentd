@@ -8,10 +8,14 @@
 //! `search` proxies the read-only routes; it never forwards reveals.
 //!
 //! Nor is loopback private from other programs: containers (OrbStack, Docker
-//! Desktop) reach the host's 127.0.0.1 and can send any Host they like. On a
-//! machine where that matters, `--token-file` makes every request but
-//! /api/health carry `Authorization: Bearer <token>`; the browser UI then
-//! only works through a proxy that adds it (agentd-web).
+//! Desktop) reach the host's 127.0.0.1 and can send any Host they like. So
+//! every API call but /api/health carries `Authorization: Bearer <token>`,
+//! the contents of a 0600 file no container mounts (AGENTD_HOME/serve-token
+//! unless --token-file says otherwise). The page itself holds no data and is
+//! open; `agentd open` gives a browser the token in the URL fragment, and the
+//! page keeps it in its own origin's storage (cookies would be shared with
+//! every other 127.0.0.1 port, containers' published ones included).
+//! agentd-web and search send it from the file.
 
 use crate::archive;
 use crate::config::Config;
@@ -77,6 +81,16 @@ pub fn load_token(path: &std::path::Path) -> Result<String> {
         std::fs::create_dir_all(dir)?;
     }
     crate::hub::password_file(path)
+}
+
+/// Needs no token: the page (it holds no data; it asks for the token) and
+/// the health check.
+pub fn open_route(method: &Method, url: &str) -> bool {
+    *method == Method::Get
+        && matches!(
+            parse_query(url).0.as_str(),
+            "/" | "/index.html" | "/api/health"
+        )
 }
 
 /// `Authorization: Bearer <token>`, compared in constant time.
@@ -240,24 +254,21 @@ pub fn handle(
     }
 }
 
-pub fn serve(cfg: &Config, port: u16, token: Option<String>) -> Result<()> {
+pub fn serve(cfg: &Config, port: u16, token: String) -> Result<()> {
     let server = Server::http(("127.0.0.1", port))
         .map_err(|e| anyhow::anyhow!("listening on 127.0.0.1:{port}: {e}"))?;
-    eprintln!(
-        "agentd · http://127.0.0.1:{port}{}",
-        if token.is_some() {
-            " (token required)"
-        } else {
-            ""
-        }
-    );
+    eprintln!("agentd · http://127.0.0.1:{port} (run `agentd open` to sign a browser in)");
     for req in server.incoming_requests() {
-        let health = *req.method() == Method::Get && parse_query(req.url()).0 == "/api/health";
-        let (status, body, html) = match &token {
-            Some(t) if !health && !token_ok(header(&req, "Authorization"), t) => {
-                (401, json!({"error": "this server needs its token"}), false)
-            }
-            _ => handle(
+        let (status, body, html) = if !open_route(req.method(), req.url())
+            && !token_ok(header(&req, "Authorization"), &token)
+        {
+            (
+                401,
+                json!({"error": "this server needs its token (agentd open)"}),
+                false,
+            )
+        } else {
+            handle(
                 cfg,
                 port,
                 req.method(),
@@ -265,7 +276,7 @@ pub fn serve(cfg: &Config, port: u16, token: Option<String>) -> Result<()> {
                 header(&req, "Host"),
                 header(&req, "X-Agentd-Reveal"),
                 header(&req, "Origin"),
-            ),
+            )
         };
         let resp = if html {
             Response::from_data(INDEX_HTML.as_bytes().to_vec())
@@ -293,6 +304,16 @@ mod tests {
         assert!(reveal_ok(Some("1"), None, 3850));
         assert!(!reveal_ok(None, Some("http://127.0.0.1:3850"), 3850));
         assert!(!reveal_ok(Some("1"), Some("https://evil.example"), 3850));
+    }
+
+    #[test]
+    fn only_the_page_and_health_are_open() {
+        assert!(open_route(&Method::Get, "/"));
+        assert!(open_route(&Method::Get, "/index.html"));
+        assert!(open_route(&Method::Get, "/api/health"));
+        assert!(!open_route(&Method::Post, "/"));
+        assert!(!open_route(&Method::Get, "/api/sessions"));
+        assert!(!open_route(&Method::Post, "/api/reveal"));
     }
 
     #[test]

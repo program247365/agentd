@@ -17,8 +17,8 @@ Macs, optionally synced between them.
 - **Reveal**: the original goes to a local vault (ChaCha20-Poly1305, key in
   the macOS Keychain) that is never synced. `agentd reveal <id>` or the
   browser's reveal button shows it, on the Mac that recorded it.
-- **Browse**: `agentd serve` is a local web UI on `127.0.0.1:3850`: page
-  through every session, see which agent and which model wrote it, full-text
+- **Browse**: `agentd serve` is a local web UI on `127.0.0.1:3850`, signed in
+  with `agentd open`: page through every session, see which agent and which model wrote it, full-text
   search everything including tool calls and output, jump to the match.
 - **Sync** (optional): point any number of Macs at one Dolt remote. Rows are
   keyed by machine, so merges never conflict, and a redact on one Mac rewrites
@@ -30,7 +30,7 @@ Macs, optionally synced between them.
 ```sh
 brew install program247365/tap/agentd   # pulls in dolt
 agentd service install                  # serve on :3850 + archive every 30 min
-open http://127.0.0.1:3850
+agentd open                             # signs this browser in and opens it
 ```
 
 Or from source: `cargo install --path .` (needs `dolt` on PATH).
@@ -44,7 +44,8 @@ Also worth doing for Claude Code, so the transcripts exist to archive: set
 |---|---|
 | `agentd run` | what the schedule runs: ingest, sync, refresh the browser |
 | `agentd ingest` | archive new and changed files only |
-| `agentd serve [--port 3850] [--token-file f]` | the browser, on 127.0.0.1 only; `--token-file` requires a bearer token (see below) |
+| `agentd serve [--port 3850] [--token-file f]` | the browser, on 127.0.0.1 only; its API needs a token (see below) |
+| `agentd open [--port 3850]` | open the browser, signed in |
 | `agentd verify [--json]` | PASS/FAIL, exit 1 on failure |
 | `agentd secrets [--json]` | count secrets by kind (never values), in the archive and in the agents' own files |
 | `agentd redact [--add]` | re-redact everything and drop the archive's history; `--add` reads an extra string from stdin |
@@ -162,18 +163,25 @@ edit the agents' own files (`agentd secrets` counts what's in them), and
 anything a command printed was already sent to the model provider as part of
 the conversation. Rotate real credentials that show up.
 
-## The browser on a shared machine
+## The browser's key
 
 `agentd serve` answers only on 127.0.0.1 and only to a `Host` of
-127.0.0.1/localhost, which stops web pages (DNS rebinding). It does not stop
-other programs: anything that can open a connection to the Mac's loopback,
-including containers through `host.docker.internal`, can set any `Host` and
-read every transcript, or ask the vault to reveal. On a Mac where that
-matters (a server running containers), start it with
-`agentd serve --token-file <path>`: every request but `/api/health` then
-needs `Authorization: Bearer <token>`, the file's contents (created random
-and 0600 if missing). The UI then works only through a proxy that adds the
-header, so leave it off on a laptop you browse from.
+127.0.0.1/localhost, which stops web pages (DNS rebinding). That doesn't stop
+other programs: anything that can connect to the Mac's loopback, containers
+included (OrbStack and Docker Desktop forward `host.docker.internal` there),
+can send any `Host`. So the API also needs a key: every request but the page
+itself and `/api/health` carries `Authorization: Bearer <token>`, from
+`~/.local/share/agentd/serve-token` (random, 0600, made on first start;
+`--token-file` puts it elsewhere). Containers can't read it.
+
+`agentd open` gives your browser the key: it opens
+`http://127.0.0.1:3850/#token=…`, and the page keeps the token in its own
+storage, which is per origin (scheme, host and port). Not a cookie, because
+cookies for 127.0.0.1 go to every port on it, including any port a container
+publishes there. The token sits in the URL fragment, which browsers never send
+to a server. A new browser or profile, or `localhost` instead of `127.0.0.1`,
+needs `agentd open` again. Something that proxies the browser (like
+agentd-web) sends the header from the file itself.
 
 ## Development
 

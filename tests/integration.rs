@@ -483,79 +483,25 @@ fn server_refuses_foreign_hosts_and_unguarded_reveals() {
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
     let base_url = format!("http://127.0.0.1:{port}");
-    assert_eq!(curl(&[&format!("{base_url}/api/health")]), "200");
-    assert_eq!(
-        curl(&[
-            "-H",
-            "Host: evil.example",
-            &format!("{base_url}/api/sessions")
-        ]),
-        "403"
-    );
-    assert_eq!(
-        curl(&[
-            "-X",
-            "POST",
-            &format!("{base_url}/api/reveal?id=000000000000")
-        ]),
-        "403"
-    );
-    assert_eq!(
-        curl(&[
-            "-X",
-            "POST",
-            "-H",
-            "X-Agentd-Reveal: 1",
-            "-H",
-            "Origin: https://evil.example",
-            &format!("{base_url}/api/reveal?id=000000000000")
-        ]),
-        "403"
-    );
-    assert_eq!(
-        curl(&[
-            "-X",
-            "POST",
-            "-H",
-            "X-Agentd-Reveal: 1",
-            &format!("{base_url}/api/reveal?id=000000000000")
-        ]),
-        "404"
-    );
-    assert_eq!(
-        curl(&[&format!(
-            "{base_url}/api/session?machine=mac-a&kind=claude&path=../../etc/passwd"
-        )]),
-        "404"
-    );
-    server.kill().unwrap();
-    server.wait().unwrap();
-
-    // --token-file: every route but health needs the bearer token, whatever the Host
-    let token_file = base.path().join("serve-token");
-    let mut server = a
-        .cmd(&[
-            "serve",
-            "--port",
-            &port.to_string(),
-            "--token-file",
-            token_file.to_str().unwrap(),
-        ])
-        .spawn()
-        .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(400));
     use std::os::unix::fs::PermissionsExt;
+
+    // the token is on by default: AGENTD_HOME/serve-token, 0600
+    let token_file = a.home.join("serve-token");
     assert_eq!(
         std::fs::metadata(&token_file).unwrap().permissions().mode() & 0o777,
         0o600
     );
     let token = std::fs::read_to_string(&token_file).unwrap();
     let bearer = format!("Authorization: Bearer {token}");
+
+    // open without it: health, and the page (no data; it asks for the token)
     assert_eq!(curl(&[&format!("{base_url}/api/health")]), "200");
+    assert_eq!(curl(&[&format!("{base_url}/")]), "200");
+    // everything else needs it, whatever the Host
     for path in [
-        "/",
         "/api/sessions",
         "/api/session?machine=mac-a&kind=claude&path=x",
+        "/api/raw?machine=mac-a&kind=claude&path=x",
     ] {
         assert_eq!(curl(&[&format!("{base_url}{path}")]), "401", "{path}");
         assert_eq!(
@@ -582,27 +528,93 @@ fn server_refuses_foreign_hosts_and_unguarded_reveals() {
         curl(&["-H", &bearer, &format!("{base_url}/api/sessions")]),
         "200"
     );
-    assert_eq!(curl(&["-H", &bearer, &format!("{base_url}/")]), "200");
-    // a restart keeps the token
-    server.kill().unwrap();
-    server.wait().unwrap();
-    let mut server = a
-        .cmd(&[
-            "serve",
-            "--port",
-            &port.to_string(),
-            "--token-file",
-            token_file.to_str().unwrap(),
-        ])
-        .spawn()
-        .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    // with the token, the browser guards still hold
     assert_eq!(
-        curl(&["-H", &bearer, &format!("{base_url}/api/sessions")]),
-        "200"
+        curl(&[
+            "-H",
+            &bearer,
+            "-H",
+            "Host: evil.example",
+            &format!("{base_url}/api/sessions")
+        ]),
+        "403"
+    );
+    assert_eq!(
+        curl(&[
+            "-H",
+            &bearer,
+            "-X",
+            "POST",
+            &format!("{base_url}/api/reveal?id=000000000000")
+        ]),
+        "403"
+    );
+    assert_eq!(
+        curl(&[
+            "-H",
+            &bearer,
+            "-X",
+            "POST",
+            "-H",
+            "X-Agentd-Reveal: 1",
+            "-H",
+            "Origin: https://evil.example",
+            &format!("{base_url}/api/reveal?id=000000000000")
+        ]),
+        "403"
+    );
+    assert_eq!(
+        curl(&[
+            "-H",
+            &bearer,
+            "-X",
+            "POST",
+            "-H",
+            "X-Agentd-Reveal: 1",
+            &format!("{base_url}/api/reveal?id=000000000000")
+        ]),
+        "404"
+    );
+    assert_eq!(
+        curl(&[
+            "-H",
+            &bearer,
+            &format!("{base_url}/api/session?machine=mac-a&kind=claude&path=../../etc/passwd")
+        ]),
+        "404"
     );
     server.kill().unwrap();
     server.wait().unwrap();
+
+    // --token-file elsewhere (kmini-home's srv data dir); a restart keeps it
+    let other = base.path().join("srv/token");
+    for _ in 0..2 {
+        let mut server = a
+            .cmd(&[
+                "serve",
+                "--port",
+                &port.to_string(),
+                "--token-file",
+                other.to_str().unwrap(),
+            ])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let t = std::fs::read_to_string(&other).unwrap();
+        assert_ne!(t, token);
+        let b = format!("Authorization: Bearer {t}");
+        assert_eq!(
+            curl(&["-H", &b, &format!("{base_url}/api/sessions")]),
+            "200"
+        );
+        assert_eq!(
+            curl(&["-H", &bearer, &format!("{base_url}/api/sessions")]),
+            "401"
+        );
+        server.kill().unwrap();
+        server.wait().unwrap();
+    }
 }
 
 fn free_port() -> u16 {

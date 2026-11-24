@@ -118,7 +118,7 @@ pub fn install(port: u16) -> Result<()> {
         }
         println!("installed {label} → {}", path.display());
     }
-    println!("browser: http://127.0.0.1:{port}");
+    println!("browser: run `agentd open` (signs your browser in to http://127.0.0.1:{port})");
     Ok(())
 }
 

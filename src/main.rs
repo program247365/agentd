@@ -48,13 +48,16 @@ enum Cmd {
     Serve {
         #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
-        /// require `Authorization: Bearer <token>` on every request but
-        /// /api/health, the token read from this file (created, random and
-        /// 0600, if missing). For a machine whose loopback other things can
-        /// reach (containers); the browser UI then only works through a proxy
-        /// that adds the header.
+        /// the API's bearer token, read from this file (created, random and
+        /// 0600, if missing); default AGENTD_HOME/serve-token. Browsers get
+        /// it from `agentd open`.
         #[arg(long)]
         token_file: Option<std::path::PathBuf>,
+    },
+    /// Open the browser signed in (hands it `agentd serve`'s token)
+    Open {
+        #[arg(long, default_value_t = DEFAULT_PORT)]
+        port: u16,
     },
     /// PASS/FAIL check of the archive against disk, itself and the browser (exit 1 on failure)
     Verify {
@@ -299,8 +302,19 @@ fn run(cli: Cli) -> Result<bool> {
             }
         }
         Cmd::Serve { port, token_file } => {
-            let token = token_file.as_deref().map(server::load_token).transpose()?;
-            server::serve(&cfg, port, token)?
+            let file = token_file.unwrap_or_else(|| cfg.serve_token_file());
+            server::serve(&cfg, port, server::load_token(&file)?)?
+        }
+        Cmd::Open { port } => {
+            let token = server::load_token(&cfg.serve_token_file())?;
+            // argv, not stdout: the token is never printed
+            let status = std::process::Command::new("open")
+                .arg(format!("http://127.0.0.1:{port}/#token={token}"))
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("`open` failed ({status})");
+            }
+            println!("opened http://127.0.0.1:{port} (this browser is now signed in)");
         }
         Cmd::Hub {
             action:

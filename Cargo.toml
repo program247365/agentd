@@ -1,6 +1,6 @@
 [package]
 name = "agentd"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Archive, redact, sync and browse your coding-agent sessions (Claude Code, Codex, pi)"
 license = "MIT"
