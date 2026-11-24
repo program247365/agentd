@@ -220,19 +220,27 @@ function go(params) {
   location.hash = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== "" && v != null && v !== false)).toString();
 }
 
-// The API needs this Mac's key (agentd serve's token): `agentd open` hands it
-// over in the URL fragment, which never reaches a server; it is kept in this
-// origin's storage (per port, unlike cookies) and sent as a bearer token.
+// The API needs this Mac's key (agentd serve's token), kept in this origin's
+// storage (per port, unlike cookies) and sent as a bearer token.
 const TOKEN_KEY = "agentd-token";
 function storedToken() { try { return localStorage.getItem(TOKEN_KEY); } catch { return null; } }
-(function takeToken() {
+// `agentd open` links carry a one-time code, never the token: the URL lands
+// in browser history (and history sync), the spent code is harmless there.
+async function takeCode() {
   const r = route();
-  const t = r.get("token");
-  if (!t) return;
-  try { localStorage.setItem(TOKEN_KEY, t); } catch {}
-  r.delete("token");
+  const code = r.get("code");
+  if (!code) return;
+  r.delete("code");
   history.replaceState(null, "", location.pathname + location.search + (r.toString() ? "#" + r : ""));
-})();
+  const res = await fetch(`/api/login?${new URLSearchParams({ code })}`, { method: "POST" });
+  const body = await res.json().catch(() => ({}));
+  if (res.ok && body.token) {
+    try { localStorage.setItem(TOKEN_KEY, body.token); } catch {}
+  } else {
+    alertLater = body.error || `sign-in failed (HTTP ${res.status})`;
+  }
+}
+let alertLater = "";
 
 async function api(path, params, init = {}) {
   const headers = new Headers(init.headers);
@@ -240,7 +248,7 @@ async function api(path, params, init = {}) {
   if (token) headers.set("Authorization", `Bearer ${token}`);
   const res = await fetch(`/api/${path}?${new URLSearchParams(params)}`, { ...init, headers });
   const body = await res.json().catch(() => ({}));
-  if (res.status === 401) throw new Error("This browser isn't signed in to agentd: run `agentd open` in Terminal.");
+  if (res.status === 401) throw new Error(alertLater || "This browser isn't signed in to agentd: run `agentd open` in Terminal.");
   if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
   return body;
 }
@@ -489,7 +497,7 @@ window.addEventListener("hashchange", render);
 document.addEventListener("keydown", (e) => {
   if (e.key === "/" && document.activeElement !== $("q")) { e.preventDefault(); $("q").focus(); }
 });
-render();
+takeCode().finally(render);
 </script>
 </body>
 </html>

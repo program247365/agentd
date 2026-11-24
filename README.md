@@ -174,14 +174,21 @@ itself and `/api/health` carries `Authorization: Bearer <token>`, from
 `~/.local/share/agentd/serve-token` (random, 0600, made on first start;
 `--token-file` puts it elsewhere). Containers can't read it.
 
-`agentd open` gives your browser the key: it opens
-`http://127.0.0.1:3850/#token=…`, and the page keeps the token in its own
-storage, which is per origin (scheme, host and port). Not a cookie, because
-cookies for 127.0.0.1 go to every port on it, including any port a container
-publishes there. The token sits in the URL fragment, which browsers never send
-to a server. A new browser or profile, or `localhost` instead of `127.0.0.1`,
-needs `agentd open` again. Something that proxies the browser (like
-agentd-web) sends the header from the file itself.
+`agentd open` signs your browser in: it opens
+`http://127.0.0.1:3850/#code=…` with a one-time code (good for 60 seconds,
+saved 0600 for the server), and the page trades it for the token at
+`POST /api/login`. Only that spent code ever lands in browser history, or in
+history sync. The page keeps the token in its own storage, which is per
+origin (scheme, host and port). Not a cookie, because cookies for 127.0.0.1
+go to every port on it, including any port a container publishes there. A
+new browser or profile, or `localhost` instead of `127.0.0.1`, needs
+`agentd open` again. Something that proxies the browser (like agentd-web)
+sends the header from the token file itself.
+
+Upgrading from 0.3.3, whose links carried the token itself: delete
+`127.0.0.1:3850` from browser history, then replace the token with
+`rm ~/.local/share/agentd/serve-token && agentd service install` and run
+`agentd open`.
 
 ## Development
 

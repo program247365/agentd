@@ -584,6 +584,43 @@ fn server_refuses_foreign_hosts_and_unguarded_reveals() {
         ]),
         "404"
     );
+    // agentd open: a one-time code in the URL, traded once for the token
+    let out = a
+        .cmd(&["open", "--port", &port.to_string()])
+        .env("AGENTD_OPEN", "/bin/echo")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!url.contains(&token), "the token must never be in the URL");
+    let code = url
+        .split_once("#code=")
+        .map(|(_, c)| c.to_string())
+        .unwrap_or_else(|| panic!("no code in {url}"));
+    let login = |code: &str, host: Option<&str>| {
+        let mut c = Command::new("curl");
+        c.args(["-s", "-X", "POST", "-w", "\n%{http_code}"]);
+        if let Some(h) = host {
+            c.args(["-H", &format!("Host: {h}")]);
+        }
+        let out = c
+            .arg(format!("{base_url}/api/login?code={code}"))
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert!(login("wrong", None).ends_with("403"));
+    assert!(login(&code, Some("evil.example")).ends_with("403"));
+    let ok = login(&code, None);
+    assert!(ok.ends_with("200"), "{ok}");
+    let body: Value = serde_json::from_str(ok.rsplit_once('\n').unwrap().0).unwrap();
+    assert_eq!(body["token"], token.as_str());
+    assert!(login(&code, None).ends_with("403"), "a code works once");
+
     server.kill().unwrap();
     server.wait().unwrap();
 

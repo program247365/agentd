@@ -71,9 +71,13 @@ impl Config {
     pub fn force_push_flag(&self) -> PathBuf {
         self.home.join("force-push-pending")
     }
-    /// `agentd serve`'s bearer token (0600); `agentd open` hands it to a browser.
+    /// `agentd serve`'s bearer token (0600); browsers get it via `agentd open`.
     pub fn serve_token_file(&self) -> PathBuf {
         self.home.join("serve-token")
+    }
+    /// `agentd open`'s one-time sign-in code and its expiry (0600).
+    pub fn open_code_file(&self) -> PathBuf {
+        self.home.join("open-code")
     }
 }
 

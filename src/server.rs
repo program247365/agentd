@@ -12,9 +12,11 @@
 //! every API call but /api/health carries `Authorization: Bearer <token>`,
 //! the contents of a 0600 file no container mounts (AGENTD_HOME/serve-token
 //! unless --token-file says otherwise). The page itself holds no data and is
-//! open; `agentd open` gives a browser the token in the URL fragment, and the
-//! page keeps it in its own origin's storage (cookies would be shared with
-//! every other 127.0.0.1 port, containers' published ones included).
+//! open. `agentd open` gives a browser a one-time code (in the URL fragment,
+//! so browser history only ever holds a spent code), which the page trades
+//! for the token at POST /api/login and keeps in its own origin's storage
+//! (cookies would be shared with every other 127.0.0.1 port, containers'
+//! published ones included).
 //! agentd-web and search send it from the file.
 
 use crate::archive;
@@ -93,13 +95,48 @@ pub fn open_route(method: &Method, url: &str) -> bool {
         )
 }
 
+fn same_secret(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// `Authorization: Bearer <token>`, compared in constant time.
 pub fn token_ok(authorization: Option<&str>, token: &str) -> bool {
-    let Some(given) = authorization.and_then(|a| a.strip_prefix("Bearer ")) else {
+    authorization
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .is_some_and(|given| same_secret(given, token))
+}
+
+/// How long an `agentd open` code is good for.
+pub const OPEN_CODE_TTL_MS: i64 = 60_000;
+
+/// `agentd open`'s side: a fresh one-time code, saved (0600) for the server.
+pub fn new_open_code(cfg: &Config) -> Result<String> {
+    let code = crate::hub::random_password();
+    let expires = crate::dolt::now_ms() + OPEN_CODE_TTL_MS;
+    crate::hub::write_private(&cfg.open_code_file(), &format!("{code} {expires}"))?;
+    Ok(code)
+}
+
+/// The server's side: true once for the current, unexpired code, which is
+/// then deleted. A wrong code leaves it in place (guessing can't burn it).
+pub fn redeem_open_code(cfg: &Config, given: &str, now_ms: i64) -> bool {
+    let file = cfg.open_code_file();
+    let Ok(saved) = std::fs::read_to_string(&file) else {
         return false;
     };
-    let (a, b) = (given.as_bytes(), token.as_bytes());
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    let mut parts = saved.split_whitespace();
+    let (Some(code), Some(expires)) = (
+        parts.next(),
+        parts.next().and_then(|e| e.parse::<i64>().ok()),
+    ) else {
+        return false;
+    };
+    if !same_secret(given, code) {
+        return false;
+    }
+    let _ = std::fs::remove_file(&file);
+    now_ms <= expires
 }
 
 /// Reveal needs the custom header, and any Origin must be this server.
@@ -259,7 +296,23 @@ pub fn serve(cfg: &Config, port: u16, token: String) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("listening on 127.0.0.1:{port}: {e}"))?;
     eprintln!("agentd · http://127.0.0.1:{port} (run `agentd open` to sign a browser in)");
     for req in server.incoming_requests() {
-        let (status, body, html) = if !open_route(req.method(), req.url())
+        let (path, params) = parse_query(req.url());
+        let (status, body, html) = if *req.method() == Method::Post && path == "/api/login" {
+            // a one-time code from `agentd open` → the token (Host-checked
+            // like everything else; a wrong code is a plain 403)
+            let code = params.get("code").map(String::as_str).unwrap_or("");
+            if !host_ok(header(&req, "Host"), port) {
+                (403, json!({"error": "wrong Host"}), false)
+            } else if redeem_open_code(cfg, code, crate::dolt::now_ms()) {
+                (200, json!({"token": token}), false)
+            } else {
+                (
+                    403,
+                    json!({"error": "that sign-in link is used or expired: run `agentd open` again"}),
+                    false,
+                )
+            }
+        } else if !open_route(req.method(), req.url())
             && !token_ok(header(&req, "Authorization"), &token)
         {
             (
@@ -314,6 +367,37 @@ mod tests {
         assert!(!open_route(&Method::Post, "/"));
         assert!(!open_route(&Method::Get, "/api/sessions"));
         assert!(!open_route(&Method::Post, "/api/reveal"));
+    }
+
+    #[test]
+    fn open_codes_work_once_and_expire() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_path_buf();
+        let cfg = Config {
+            home: d.clone(),
+            machine: "t".into(),
+            roots: crate::config::Roots {
+                claude_projects: d.clone(),
+                codex_sessions: d.clone(),
+                codex_home: d.clone(),
+                pi_sessions: d,
+            },
+        };
+        let now = crate::dolt::now_ms();
+        assert!(!redeem_open_code(&cfg, "anything", now), "no code yet");
+        let code = new_open_code(&cfg).unwrap();
+        assert!(!redeem_open_code(&cfg, "wrong", now));
+        assert!(
+            redeem_open_code(&cfg, &code, now),
+            "a wrong guess didn't burn it"
+        );
+        assert!(!redeem_open_code(&cfg, &code, now), "used once");
+        let code = new_open_code(&cfg).unwrap();
+        assert!(
+            !redeem_open_code(&cfg, &code, now + OPEN_CODE_TTL_MS + 5_000),
+            "expired"
+        );
+        assert!(!redeem_open_code(&cfg, &code, now), "and gone");
     }
 
     #[test]

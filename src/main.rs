@@ -306,15 +306,20 @@ fn run(cli: Cli) -> Result<bool> {
             server::serve(&cfg, port, server::load_token(&file)?)?
         }
         Cmd::Open { port } => {
-            let token = server::load_token(&cfg.serve_token_file())?;
-            // argv, not stdout: the token is never printed
-            let status = std::process::Command::new("open")
-                .arg(format!("http://127.0.0.1:{port}/#token={token}"))
+            std::fs::create_dir_all(&cfg.home)?;
+            // a one-time code, not the token: the URL lands in browser history
+            let code = server::new_open_code(&cfg)?;
+            let opener = std::env::var("AGENTD_OPEN").unwrap_or_else(|_| "open".into());
+            let status = std::process::Command::new(&opener)
+                .arg(format!("http://127.0.0.1:{port}/#code={code}"))
                 .status()?;
             if !status.success() {
-                anyhow::bail!("`open` failed ({status})");
+                anyhow::bail!("{opener} failed ({status})");
             }
-            println!("opened http://127.0.0.1:{port} (this browser is now signed in)");
+            eprintln!(
+                "opened http://127.0.0.1:{port}; the link signs this browser in once, within {}s",
+                server::OPEN_CODE_TTL_MS / 1000
+            );
         }
         Cmd::Hub {
             action:
