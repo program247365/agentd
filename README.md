@@ -44,7 +44,7 @@ Also worth doing for Claude Code, so the transcripts exist to archive: set
 |---|---|
 | `agentd run` | what the schedule runs: ingest, sync, refresh the browser |
 | `agentd ingest` | archive new and changed files only |
-| `agentd serve [--port 3850]` | the browser, on 127.0.0.1 only |
+| `agentd serve [--port 3850] [--token-file f]` | the browser, on 127.0.0.1 only; `--token-file` requires a bearer token (see below) |
 | `agentd verify [--json]` | PASS/FAIL, exit 1 on failure |
 | `agentd secrets [--json]` | count secrets by kind (never values), in the archive and in the agents' own files |
 | `agentd redact [--add]` | re-redact everything and drop the archive's history; `--add` reads an extra string from stdin |
@@ -91,7 +91,7 @@ On each Mac:
 
 ```sh
 agentd sync key       # makes a key for agentd and prints one line:
-                      # restrict,port-forwarding,permitopen="127.0.0.1:50052",command="/usr/bin/false" ssh-ed25519 …
+                      # restrict,port-forwarding,permitopen="127.0.0.1:50052",command="cat ~/.config/agentd-hub/agentd-password" ssh-ed25519 …
                       # append it to ~/.ssh/authorized_keys on the server
 agentd sync add ssh://you@server/agents
 agentd sync           # or wait for the scheduled run
@@ -100,11 +100,24 @@ agentd sync           # or wait for the scheduled run
 `ssh://[user@]host[:ssh-port]/<database>[?port=<hub port>&key=<path>]`.
 Losing a Mac means deleting one line from `authorized_keys`.
 
+(If you SSH in some other way that gives a shell, such as Tailscale SSH,
+skip `sync key`: `sync add ssh://you@server/agents` is enough.)
+
 What the hub does (`agentd hub serve [--dir] [--remotes-port 50052] [--sql-port 3851] [--health-port N]`):
 it runs `dolt sql-server` with SQL on 127.0.0.1, and before the remotes port
 ever opens it sets a random root password (kept 0600 in the hub dir) and
-creates an `agentd@localhost` user with no password. The tunnel arrives on
-the server's loopback, so it signs in as that user.
+creates an `agentd@localhost` user with its own random password, kept 0600
+at `~/.config/agentd-hub/agentd-password` (`AGENTD_HUB_PASSWORD_FILE`
+overrides). The tunnel arrives on the server's loopback and signs in as that
+user. Each sync first reads the password over the same SSH login (`cat` of
+that path; the restricted key's only command), so a Mac never stores it and
+SSH access is the whole credential: revoke a Mac at SSH and it's out.
+
+Why a password on a loopback-only user: loopback is shared with everything
+else on the server. Containers (OrbStack, Docker Desktop) reach the host's
+127.0.0.1 through `host.docker.internal`, and with no password any of them
+could read or rewrite the archive. Hubs from before 0.3.2 get the password
+on their next start; Macs on older agentd stop syncing until upgraded.
 
 Know this about the hub: **Dolt's remotes API listens on every interface**;
 there is no option to bind it to loopback. A client that reaches the port
@@ -148,6 +161,19 @@ Redaction protects the archive and everything synced from it. It does not
 edit the agents' own files (`agentd secrets` counts what's in them), and
 anything a command printed was already sent to the model provider as part of
 the conversation. Rotate real credentials that show up.
+
+## The browser on a shared machine
+
+`agentd serve` answers only on 127.0.0.1 and only to a `Host` of
+127.0.0.1/localhost, which stops web pages (DNS rebinding). It does not stop
+other programs: anything that can open a connection to the Mac's loopback,
+including containers through `host.docker.internal`, can set any `Host` and
+read every transcript, or ask the vault to reveal. On a Mac where that
+matters (a server running containers), start it with
+`agentd serve --token-file <path>`: every request but `/api/health` then
+needs `Authorization: Bearer <token>`, the file's contents (created random
+and 0600 if missing). The UI then works only through a proxy that adds the
+header, so leave it off on a laptop you browse from.
 
 ## Development
 

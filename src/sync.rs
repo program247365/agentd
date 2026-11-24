@@ -74,17 +74,15 @@ pub fn remove(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// fetch/push against the remote, with the configured user. The password
-/// (none, for an agentd hub reached through a tunnel) comes from
-/// AGENTD_REMOTE_PASSWORD, via the environment rather than argv.
-fn remote(dir: &Path, s: &SyncConfig, verb: &str, rest: &[&str]) -> Result<String> {
+/// fetch/push against the remote, with the configured user and password,
+/// passed to Dolt through the environment rather than argv.
+fn remote(dir: &Path, s: &SyncConfig, pw: &str, verb: &str, rest: &[&str]) -> Result<String> {
     let mut args = vec![verb];
     if let Some(u) = &s.user {
         args.extend(["--user", u.as_str()]);
     }
     args.extend_from_slice(rest);
-    let pw = std::env::var("AGENTD_REMOTE_PASSWORD").unwrap_or_default();
-    dolt::dolt_env(dir, &args, &[("DOLT_REMOTE_PASSWORD", pw.as_str())])
+    dolt::dolt_env(dir, &args, &[("DOLT_REMOTE_PASSWORD", pw)])
 }
 
 #[derive(Debug, Serialize, Default, PartialEq)]
@@ -133,6 +131,13 @@ pub fn run(cfg: &Config, literals: &[String], vault: Option<&Vault>) -> Result<S
         bail!("archive has uncommitted changes; run `agentd ingest` first");
     }
     let settings = tunnel::load(cfg)?;
+    // AGENTD_REMOTE_PASSWORD wins; an agentd hub hands its password to
+    // whoever can SSH in, read fresh each sync
+    let pw = match (std::env::var("AGENTD_REMOTE_PASSWORD"), &settings.ssh) {
+        (Ok(p), _) if !p.is_empty() => p,
+        (_, Some(t)) => tunnel::fetch_password(cfg, t)?,
+        _ => String::new(),
+    };
     // held for the whole sync; closed on return, success or not
     let _tunnel = match &settings.ssh {
         Some(t) => Some(tunnel::open(cfg, t)?),
@@ -142,18 +147,18 @@ pub fn run(cfg: &Config, literals: &[String], vault: Option<&Vault>) -> Result<S
         // This Mac rewrote history (redact). Its archive already holds every
         // machine's rows as of its last pull, redacted; publish it as-is.
         archive::record_sync(&dir, &cfg.machine, dolt::now_ms())?;
-        remote(&dir, &settings, "push", &["--force", REMOTE, BRANCH])?;
+        remote(&dir, &settings, &pw, "push", &["--force", REMOTE, BRANCH])?;
         std::fs::remove_file(cfg.force_push_flag())?;
         res.force_pushed = true;
         res.pushed = true;
         return Ok(res);
     }
-    remote(&dir, &settings, "fetch", &[REMOTE])?;
+    remote(&dir, &settings, &pw, "fetch", &[REMOTE])?;
     if remote_has_branch(&dir)? && !remote_has_archive(&dir) {
         // the first Mac to reach a new hub publishes its archive over the
         // hub's empty first commit
         archive::record_sync(&dir, &cfg.machine, dolt::now_ms())?;
-        remote(&dir, &settings, "push", &["--force", REMOTE, BRANCH])?;
+        remote(&dir, &settings, &pw, "push", &["--force", REMOTE, BRANCH])?;
         res.pushed = true;
         res.force_pushed = true;
         return Ok(res);
@@ -177,7 +182,7 @@ pub fn run(cfg: &Config, literals: &[String], vault: Option<&Vault>) -> Result<S
         }
     }
     archive::record_sync(&dir, &cfg.machine, dolt::now_ms())?;
-    remote(&dir, &settings, "push", &[REMOTE, BRANCH])?;
+    remote(&dir, &settings, &pw, "push", &[REMOTE, BRANCH])?;
     res.pushed = true;
     Ok(res)
 }

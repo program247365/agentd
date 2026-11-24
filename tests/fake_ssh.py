@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""Stands in for `ssh -N -L 127.0.0.1:L:127.0.0.1:R target` in tests: forwards
-local port L to R. A target starting with "denied" fails like real ssh does."""
-import socket, sys, threading
+"""Stands in for ssh in tests. `ssh -N -L 127.0.0.1:L:127.0.0.1:R target`
+forwards local port L to R; `ssh target command` runs the command with HOME
+set to $FAKE_SSH_HOME (the "server's" home). A target starting with "denied"
+fails like real ssh does."""
+import os, socket, subprocess, sys, threading
 
 args = sys.argv[1:]
+if "-L" not in args:
+    target, command = args[-2], args[-1]
+    if target.startswith("denied"):
+        sys.stderr.write(f"{target}: Permission denied (publickey).\n")
+        sys.exit(255)
+    env = dict(os.environ, HOME=os.environ["FAKE_SSH_HOME"])
+    sys.exit(subprocess.run(["/bin/sh", "-c", command], env=env).returncode)
 if args[-1].startswith("denied"):
     sys.stderr.write(f"{args[-1]}: Permission denied (publickey).\n")
     sys.exit(255)

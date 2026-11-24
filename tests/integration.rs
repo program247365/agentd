@@ -530,6 +530,79 @@ fn server_refuses_foreign_hosts_and_unguarded_reveals() {
     );
     server.kill().unwrap();
     server.wait().unwrap();
+
+    // --token-file: every route but health needs the bearer token, whatever the Host
+    let token_file = base.path().join("serve-token");
+    let mut server = a
+        .cmd(&[
+            "serve",
+            "--port",
+            &port.to_string(),
+            "--token-file",
+            token_file.to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&token_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let token = std::fs::read_to_string(&token_file).unwrap();
+    let bearer = format!("Authorization: Bearer {token}");
+    assert_eq!(curl(&[&format!("{base_url}/api/health")]), "200");
+    for path in [
+        "/",
+        "/api/sessions",
+        "/api/session?machine=mac-a&kind=claude&path=x",
+    ] {
+        assert_eq!(curl(&[&format!("{base_url}{path}")]), "401", "{path}");
+        assert_eq!(
+            curl(&[
+                "-H",
+                "Authorization: Bearer wrong",
+                &format!("{base_url}{path}")
+            ]),
+            "401",
+            "{path}"
+        );
+    }
+    assert_eq!(
+        curl(&[
+            "-X",
+            "POST",
+            "-H",
+            "X-Agentd-Reveal: 1",
+            &format!("{base_url}/api/reveal?id=000000000000")
+        ]),
+        "401"
+    );
+    assert_eq!(
+        curl(&["-H", &bearer, &format!("{base_url}/api/sessions")]),
+        "200"
+    );
+    assert_eq!(curl(&["-H", &bearer, &format!("{base_url}/")]), "200");
+    // a restart keeps the token
+    server.kill().unwrap();
+    server.wait().unwrap();
+    let mut server = a
+        .cmd(&[
+            "serve",
+            "--port",
+            &port.to_string(),
+            "--token-file",
+            token_file.to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert_eq!(
+        curl(&["-H", &bearer, &format!("{base_url}/api/sessions")]),
+        "200"
+    );
+    server.kill().unwrap();
+    server.wait().unwrap();
 }
 
 fn free_port() -> u16 {
@@ -556,11 +629,17 @@ impl Drop for Hub {
     }
 }
 
-fn start_hub(dir: &Path) -> Hub {
+/// `ssh_home` stands in for the SSH user's home on the server: the hub keeps
+/// the sync password under it, and fake_ssh runs commands there.
+fn start_hub(dir: &Path, ssh_home: &Path) -> Hub {
     use std::os::unix::process::CommandExt;
     let (remotes, sql, health) = (free_port(), free_port(), free_port());
     let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args(["hub", "serve", "--dir", dir.to_str().unwrap()])
+        .env(
+            "AGENTD_HUB_PASSWORD_FILE",
+            ssh_home.join(".config/agentd-hub/agentd-password"),
+        )
         .args([
             "--remotes-port",
             &remotes.to_string(),
@@ -598,7 +677,8 @@ fn two_macs_sync_through_an_ssh_tunnel_to_a_hub() {
     }
     let base = tempfile::tempdir().unwrap();
     let hub_dir = base.path().join("hub");
-    let hub = start_hub(&hub_dir);
+    let ssh_home = base.path().join("server-home");
+    let hub = start_hub(&hub_dir, &ssh_home);
 
     // the hub locked root down before opening the remotes port
     let pw = hub_dir.join("root-password");
@@ -621,6 +701,28 @@ fn two_macs_sync_through_an_ssh_tunnel_to_a_hub() {
         "{}",
         String::from_utf8_lossy(&anon.stderr)
     );
+    // and the Macs' user needs its password too: loopback is shared with
+    // whatever else runs on the server (containers)
+    let agentd_pw = ssh_home.join(".config/agentd-hub/agentd-password");
+    assert_eq!(
+        std::fs::metadata(&agentd_pw).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let no_pw = Command::new("dolt")
+        .args([
+            "clone",
+            "--user",
+            "agentd",
+            &format!("http://127.0.0.1:{}/agents", hub.remotes),
+            base.path().join("no-pw").to_str().unwrap(),
+        ])
+        .env("DOLT_REMOTE_PASSWORD", "")
+        .output()
+        .unwrap();
+    assert!(
+        !no_pw.status.success(),
+        "passwordless agentd clone must be refused"
+    );
 
     let fake_ssh = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_ssh.py");
     let url = format!("ssh://agentd@hub-host/agents?port={}", hub.remotes);
@@ -637,7 +739,12 @@ fn two_macs_sync_through_an_ssh_tunnel_to_a_hub() {
         &session("claude-fable-5", "/Users/x/beta", "b asks", "pwd", "/tmp"),
     );
     let run = |m: &Mac, args: &[&str]| {
-        let out = m.cmd(args).env("AGENTD_SSH", &fake_ssh).output().unwrap();
+        let out = m
+            .cmd(args)
+            .env("AGENTD_SSH", &fake_ssh)
+            .env("FAKE_SSH_HOME", &ssh_home)
+            .output()
+            .unwrap();
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -697,6 +804,7 @@ fn two_macs_sync_through_an_ssh_tunnel_to_a_hub() {
     let out = c
         .cmd(&["run"])
         .env("AGENTD_SSH", &fake_ssh)
+        .env("FAKE_SSH_HOME", &ssh_home)
         .output()
         .unwrap();
     let text = format!(

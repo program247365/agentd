@@ -6,6 +6,12 @@
 //! custom header (a cross-site page can't send one without a CORS preflight,
 //! which this server never approves) and, if present, a same-origin Origin.
 //! `search` proxies the read-only routes; it never forwards reveals.
+//!
+//! Nor is loopback private from other programs: containers (OrbStack, Docker
+//! Desktop) reach the host's 127.0.0.1 and can send any Host they like. On a
+//! machine where that matters, `--token-file` makes every request but
+//! /api/health carry `Authorization: Bearer <token>`; the browser UI then
+//! only works through a proxy that adds it (agentd-web).
 
 use crate::archive;
 use crate::config::Config;
@@ -63,6 +69,23 @@ fn header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
 /// Host must name this server: blocks DNS rebinding.
 pub fn host_ok(host: Option<&str>, port: u16) -> bool {
     matches!(host, Some(h) if h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}"))
+}
+
+/// The token for `--token-file`, created (random, 0600) if the file is missing.
+pub fn load_token(path: &std::path::Path) -> Result<String> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    crate::hub::password_file(path)
+}
+
+/// `Authorization: Bearer <token>`, compared in constant time.
+pub fn token_ok(authorization: Option<&str>, token: &str) -> bool {
+    let Some(given) = authorization.and_then(|a| a.strip_prefix("Bearer ")) else {
+        return false;
+    };
+    let (a, b) = (given.as_bytes(), token.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Reveal needs the custom header, and any Origin must be this server.
@@ -217,20 +240,33 @@ pub fn handle(
     }
 }
 
-pub fn serve(cfg: &Config, port: u16) -> Result<()> {
+pub fn serve(cfg: &Config, port: u16, token: Option<String>) -> Result<()> {
     let server = Server::http(("127.0.0.1", port))
         .map_err(|e| anyhow::anyhow!("listening on 127.0.0.1:{port}: {e}"))?;
-    eprintln!("agentd · http://127.0.0.1:{port}");
+    eprintln!(
+        "agentd · http://127.0.0.1:{port}{}",
+        if token.is_some() {
+            " (token required)"
+        } else {
+            ""
+        }
+    );
     for req in server.incoming_requests() {
-        let (status, body, html) = handle(
-            cfg,
-            port,
-            req.method(),
-            req.url(),
-            header(&req, "Host"),
-            header(&req, "X-Agentd-Reveal"),
-            header(&req, "Origin"),
-        );
+        let health = *req.method() == Method::Get && parse_query(req.url()).0 == "/api/health";
+        let (status, body, html) = match &token {
+            Some(t) if !health && !token_ok(header(&req, "Authorization"), t) => {
+                (401, json!({"error": "this server needs its token"}), false)
+            }
+            _ => handle(
+                cfg,
+                port,
+                req.method(),
+                req.url(),
+                header(&req, "Host"),
+                header(&req, "X-Agentd-Reveal"),
+                header(&req, "Origin"),
+            ),
+        };
         let resp = if html {
             Response::from_data(INDEX_HTML.as_bytes().to_vec())
                 .with_header(Header::from_bytes("Content-Type", "text/html; charset=utf-8").unwrap())
@@ -257,6 +293,15 @@ mod tests {
         assert!(reveal_ok(Some("1"), None, 3850));
         assert!(!reveal_ok(None, Some("http://127.0.0.1:3850"), 3850));
         assert!(!reveal_ok(Some("1"), Some("https://evil.example"), 3850));
+    }
+
+    #[test]
+    fn token_guard() {
+        assert!(token_ok(Some("Bearer abc123"), "abc123"));
+        assert!(!token_ok(Some("Bearer abc124"), "abc123"));
+        assert!(!token_ok(Some("Bearer abc12"), "abc123"));
+        assert!(!token_ok(Some("abc123"), "abc123"));
+        assert!(!token_ok(None, "abc123"));
     }
 
     #[test]

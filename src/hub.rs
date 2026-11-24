@@ -8,8 +8,13 @@
 //!   - root gets a long random password on first start (kept 0600 in the hub
 //!     dir). An anonymous remotes client is treated as root, so without this
 //!     anyone who can reach the port can read and write everything.
-//!   - `agentd`@`localhost`, no password: usable only from the server's own
-//!     loopback, which is where the SSH tunnel arrives.
+//!   - `agentd`@`localhost`, the user the Macs sync as, also with a random
+//!     password. Loopback alone is not private: containers on the server
+//!     (OrbStack, Docker Desktop) reach the host's 127.0.0.1, and so does
+//!     every local process. It lives at a fixed path,
+//!     ~/.config/agentd-hub/agentd-password (0600), so a Mac can read it over
+//!     the same SSH login it tunnels through, at each sync: nothing to copy,
+//!     and access to it is exactly access to SSH.
 //!
 //! Close the port at the firewall too if the server allows it.
 //!
@@ -33,7 +38,7 @@ pub struct HubOpts {
     pub health_port: Option<u16>,
 }
 
-fn write_private(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -110,32 +115,69 @@ fn wait_ready(o: &HubOpts, child: &mut Child, user: &str, password: &str) -> Res
     }
 }
 
-fn random_password() -> String {
+pub(crate) fn random_password() -> String {
     use chacha20poly1305::aead::{rand_core::RngCore, OsRng};
     let mut b = [0u8; 24];
     OsRng.fill_bytes(&mut b);
     hex::encode(b)
 }
 
-/// Idempotent: the database, the loopback-only agentd user, and on first
+/// The password in `file`, creating it (0600, random) if it doesn't exist.
+/// Saved before it is ever set, so it can't be lost.
+pub(crate) fn password_file(file: &Path) -> Result<String> {
+    if let Ok(s) = std::fs::read_to_string(file) {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Ok(s.to_string());
+        }
+    }
+    let pw = random_password();
+    write_private(file, &pw)?;
+    Ok(pw)
+}
+
+/// Where the agentd user's password lives: AGENTD_HUB_PASSWORD_FILE, else
+/// the path Macs read over SSH (tunnel::HUB_PASSWORD_PATH under $HOME).
+pub fn agentd_password_path() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("AGENTD_HUB_PASSWORD_FILE") {
+        return Ok(PathBuf::from(p));
+    }
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(crate::tunnel::HUB_PASSWORD_PATH.trim_start_matches("~/")))
+}
+
+/// Idempotent: the database, the agentd user and its password, and on first
 /// start the root password. Runs with the remotes API closed.
-fn setup(o: &HubOpts) -> Result<String> {
+fn setup(o: &HubOpts) -> Result<(String, String)> {
     let pw_file = o.dir.join("root-password");
     let existing = std::fs::read_to_string(&pw_file)
         .ok()
         .map(|s| s.trim().to_string());
+    // hex from random_password() or a file only this user can write: safe in SQL
+    let agentd_file = agentd_password_path()?;
+    if let Some(parent) = agentd_file.parent() {
+        std::fs::create_dir_all(parent)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let agentd_pw = password_file(&agentd_file)?;
+    if !agentd_pw.chars().all(|c| c.is_ascii_alphanumeric()) {
+        bail!("{} must be letters and digits only", agentd_file.display());
+    }
     let mut child = start(o, false)?;
     let result = (|| {
         let root_pw = existing.clone().unwrap_or_default();
         wait_ready(o, &mut child, "root", &root_pw)?;
         let db = &o.database;
+        // ALTER as well as CREATE: hubs from before 0.3.2 made this user with
+        // no password
         sql(
             o,
             "root",
             &root_pw,
             &format!(
                 "CREATE DATABASE IF NOT EXISTS `{db}`;
-                 CREATE USER IF NOT EXISTS 'agentd'@'localhost' IDENTIFIED BY '';
+                 CREATE USER IF NOT EXISTS 'agentd'@'localhost' IDENTIFIED BY '{agentd_pw}';
+                 ALTER USER 'agentd'@'localhost' IDENTIFIED BY '{agentd_pw}';
                  GRANT ALL ON *.* TO 'agentd'@'localhost';
                  GRANT CLONE_ADMIN ON *.* TO 'agentd'@'localhost';"
             ),
@@ -149,9 +191,9 @@ fn setup(o: &HubOpts) -> Result<String> {
                 "",
                 &format!("ALTER USER 'root'@'localhost' IDENTIFIED BY '{pw}';"),
             )?;
-            return Ok(pw);
+            return Ok((pw, agentd_pw));
         }
-        Ok(root_pw)
+        Ok((root_pw, agentd_pw))
     })();
     let _ = child.kill();
     let _ = child.wait();
@@ -169,12 +211,14 @@ pub fn serve(o: HubOpts) -> Result<()> {
     }
     std::fs::create_dir_all(o.dir.join("data"))?;
     std::fs::set_permissions(&o.dir, std::fs::Permissions::from_mode(0o700))?;
-    let root_pw = setup(&o)?;
+    let (root_pw, agentd_pw) = setup(&o)?;
     let mut child = start(&o, true)?;
     wait_ready(&o, &mut child, "root", &root_pw)?;
     eprintln!(
-        "agentd hub: database {} on remotes port {} (sql 127.0.0.1:{}); reach it with agentd sync add ssh://<this host>/{}?port={}",
-        o.database, o.remotes_port, o.sql_port, o.database, o.remotes_port
+        "agentd hub: database {} on remotes port {} (sql 127.0.0.1:{}, user agentd, password in {}); reach it with agentd sync add ssh://<this host>/{}?port={}",
+        o.database, o.remotes_port, o.sql_port,
+        agentd_password_path()?.display(),
+        o.database, o.remotes_port
     );
     let Some(port) = o.health_port else {
         let status = child.wait()?;
@@ -195,7 +239,7 @@ pub fn serve(o: HubOpts) -> Result<()> {
     let server = tiny_http::Server::http(("127.0.0.1", port))
         .map_err(|e| anyhow::anyhow!("health port {port}: {e}"))?;
     for req in server.incoming_requests() {
-        let ok = req.url() == "/health" && sql(&o, "agentd", "", "SELECT 1").is_ok();
+        let ok = req.url() == "/health" && sql(&o, "agentd", &agentd_pw, "SELECT 1").is_ok();
         let resp = tiny_http::Response::from_string(if ok { "ok\n" } else { "not ready\n" })
             .with_status_code(if ok {
                 200

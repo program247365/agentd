@@ -6,6 +6,11 @@
 //! server, and access is whatever SSH allows: a dedicated key per Mac (see
 //! `agentd sync key`) restricted to that one forward.
 //!
+//! The hub's remotes user has a password (loopback is shared with whatever
+//! else runs on the server, containers included). Each sync first reads it
+//! over SSH, from the fixed path the hub keeps it at, so holding an SSH login
+//! is the whole credential and no Mac stores the password.
+//!
 //! The settings live in AGENTD_HOME/sync.json, outside the Dolt repo, so they
 //! are never synced. Dolt itself only ever sees http://127.0.0.1:<local>/db.
 
@@ -20,6 +25,8 @@ use std::time::{Duration, Instant};
 
 pub const DEFAULT_REMOTES_PORT: u16 = 50052;
 pub const HUB_USER: &str = "agentd";
+/// On the hub, relative to the SSH user's home; see hub.rs.
+pub const HUB_PASSWORD_PATH: &str = "~/.config/agentd-hub/agentd-password";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SyncConfig {
@@ -123,15 +130,12 @@ pub fn parse_ssh_url(url: &str, default_key: Option<PathBuf>) -> Result<(SshTunn
     ))
 }
 
-/// The ssh invocation, without the program name.
-pub fn ssh_args(t: &SshTunnel, known_hosts: &Path) -> Vec<String> {
+/// Options every ssh call shares, ending with the port and target.
+fn common_args(t: &SshTunnel, known_hosts: &Path) -> Vec<String> {
     let mut a: Vec<String> = [
-        "-N",
         "-T",
         "-o",
         "BatchMode=yes", // never prompt: this runs under launchd
-        "-o",
-        "ExitOnForwardFailure=yes",
         "-o",
         "StrictHostKeyChecking=accept-new", // trust on first use; a changed key fails
         "-o",
@@ -156,14 +160,70 @@ pub fn ssh_args(t: &SshTunnel, known_hosts: &Path) -> Vec<String> {
             k.display().to_string(),
         ]);
     }
+    a.extend(["-p".into(), t.ssh_port.to_string()]);
+    a
+}
+
+/// The tunnel's ssh invocation, without the program name.
+pub fn ssh_args(t: &SshTunnel, known_hosts: &Path) -> Vec<String> {
+    let mut a: Vec<String> = ["-N", "-o", "ExitOnForwardFailure=yes"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    a.extend(common_args(t, known_hosts));
     a.extend([
-        "-p".into(),
-        t.ssh_port.to_string(),
         "-L".into(),
         format!("127.0.0.1:{}:127.0.0.1:{}", t.local_port, t.remote_port),
         t.target.clone(),
     ]);
     a
+}
+
+/// The ssh invocation that prints the hub's password. A restricted key's
+/// forced command (see authorized_keys_line) runs the same `cat`.
+pub fn password_args(t: &SshTunnel, known_hosts: &Path) -> Vec<String> {
+    let mut a = common_args(t, known_hosts);
+    a.extend([t.target.clone(), format!("cat {HUB_PASSWORD_PATH}")]);
+    a
+}
+
+fn known_hosts(cfg: &Config) -> Result<PathBuf> {
+    let known = cfg.home.join("ssh/known_hosts");
+    if let Some(dir) = known.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(known)
+}
+
+/// Reads the hub's password over SSH. Empty when the hub has none to give
+/// (a hub from before 0.3.2, or a key line that only allows the forward);
+/// an error when ssh itself fails (exit 255), as the tunnel would too.
+pub fn fetch_password(cfg: &Config, t: &SshTunnel) -> Result<String> {
+    let ssh = std::env::var("AGENTD_SSH").unwrap_or_else(|_| "ssh".into());
+    let out = Command::new(&ssh)
+        .args(password_args(t, &known_hosts(cfg)?))
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("starting {ssh}"))?;
+    if out.status.code() == Some(255) {
+        bail!(
+            "ssh to {} failed: {}",
+            t.target,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let pw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || pw.is_empty() {
+        eprintln!(
+            "agentd: {} gave no sync password (hub older than agentd 0.3.2, or an authorized_keys line from before it: re-run `agentd sync key`); trying without one",
+            t.target
+        );
+        return Ok(String::new());
+    }
+    if !pw.chars().all(|c| c.is_ascii_alphanumeric()) {
+        bail!("{} returned something that isn't a hub password", t.target);
+    }
+    Ok(pw)
 }
 
 /// An open tunnel; closed when dropped, whatever the sync did.
@@ -185,13 +245,9 @@ pub fn open(cfg: &Config, t: &SshTunnel) -> Result<Tunnel> {
             t.local_port
         );
     }
-    let known = cfg.home.join("ssh/known_hosts");
-    if let Some(dir) = known.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     let ssh = std::env::var("AGENTD_SSH").unwrap_or_else(|_| "ssh".into());
     let mut child = Command::new(&ssh)
-        .args(ssh_args(t, &known))
+        .args(ssh_args(t, &known_hosts(cfg)?))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -223,8 +279,9 @@ pub fn open(cfg: &Config, t: &SshTunnel) -> Result<Tunnel> {
 }
 
 /// Creates the dedicated key (once) and returns the authorized_keys line for
-/// the server: forwarding to the hub's loopback port only, no shell, no pty,
-/// no agent or X11 forwarding.
+/// the server: forwarding to the hub's loopback port only, no pty, no agent
+/// or X11 forwarding, and no shell: the only command it can run prints the
+/// hub's password.
 pub fn ensure_key(cfg: &Config, remote_port: u16) -> Result<String> {
     let key = key_path(cfg);
     if !key.exists() {
@@ -256,7 +313,7 @@ pub fn ensure_key(cfg: &Config, remote_port: u16) -> Result<String> {
 
 pub fn authorized_keys_line(public_key: &str, remote_port: u16) -> String {
     format!(
-        r#"restrict,port-forwarding,permitopen="127.0.0.1:{remote_port}",command="/usr/bin/false" {public_key}"#
+        r#"restrict,port-forwarding,permitopen="127.0.0.1:{remote_port}",command="cat {HUB_PASSWORD_PATH}" {public_key}"#
     )
 }
 
@@ -316,6 +373,13 @@ mod tests {
             "{s}"
         );
         assert_eq!(a.last().unwrap(), "u@h");
+        let p = password_args(&t, Path::new("/kh"));
+        assert!(!p.iter().any(|x| x == "-L" || x == "-N"), "{p:?}");
+        assert!(p.join(" ").contains("BatchMode=yes -o"), "{p:?}");
+        assert_eq!(
+            &p[p.len() - 2..],
+            ["u@h", "cat ~/.config/agentd-hub/agentd-password"]
+        );
     }
 
     #[test]
@@ -323,7 +387,7 @@ mod tests {
         let l = authorized_keys_line("ssh-ed25519 AAAA agentd@m", 50052);
         assert_eq!(
             l,
-            r#"restrict,port-forwarding,permitopen="127.0.0.1:50052",command="/usr/bin/false" ssh-ed25519 AAAA agentd@m"#
+            r#"restrict,port-forwarding,permitopen="127.0.0.1:50052",command="cat ~/.config/agentd-hub/agentd-password" ssh-ed25519 AAAA agentd@m"#
         );
     }
 }

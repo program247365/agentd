@@ -48,6 +48,13 @@ enum Cmd {
     Serve {
         #[arg(long, default_value_t = DEFAULT_PORT)]
         port: u16,
+        /// require `Authorization: Bearer <token>` on every request but
+        /// /api/health, the token read from this file (created, random and
+        /// 0600, if missing). For a machine whose loopback other things can
+        /// reach (containers); the browser UI then only works through a proxy
+        /// that adds the header.
+        #[arg(long)]
+        token_file: Option<std::path::PathBuf>,
     },
     /// PASS/FAIL check of the archive against disk, itself and the browser (exit 1 on failure)
     Verify {
@@ -87,8 +94,9 @@ enum SyncCmd {
     /// reached through an SSH tunnel, or any Dolt remote URL (s3://…, file://…, http://…)
     Add {
         url: String,
-        /// remotes-API user (ssh:// remotes default to the hub's "agentd");
-        /// a password, if needed, comes from AGENTD_REMOTE_PASSWORD
+        /// remotes-API user (ssh:// remotes default to the hub's "agentd",
+        /// whose password is read from the hub over SSH at each sync);
+        /// otherwise a password, if needed, comes from AGENTD_REMOTE_PASSWORD
         #[arg(long)]
         user: Option<String>,
     },
@@ -279,7 +287,7 @@ fn run(cli: Cli) -> Result<bool> {
                         "key: {} (dedicated to agentd; no passphrase so it works unattended)",
                         tunnel::key_path(&cfg).display()
                     );
-                    eprintln!("add this line to ~/.ssh/authorized_keys on the server (forwarding to port {port} only, no shell):");
+                    eprintln!("add this line to ~/.ssh/authorized_keys on the server (forwarding to port {port} only; its one command prints the hub's sync password):");
                     println!("{line}");
                 }
                 None => {
@@ -290,7 +298,10 @@ fn run(cli: Cli) -> Result<bool> {
                 }
             }
         }
-        Cmd::Serve { port } => server::serve(&cfg, port)?,
+        Cmd::Serve { port, token_file } => {
+            let token = token_file.as_deref().map(server::load_token).transpose()?;
+            server::serve(&cfg, port, token)?
+        }
         Cmd::Hub {
             action:
                 HubCmd::Serve {
